@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Target Discord Restock Monitor - 95279108
 // @namespace    HootLoot
-// @version      1.2
-// @description  Monitor one Discord channel for a Target drop, show Discord heartbeat on Target, and add one item to cart
+// @version      1.3
+// @description  Monitor Discord for Target 95279108 and add it from Favorites
 // @match        https://discord.com/channels/1349910660317843540/1369180056144056321*
 // @match        https://www.target.com/lists/favorites*
 // @match        https://www.target.com/p/*/-/A-95279108*
@@ -16,15 +16,14 @@
 
     const TCIN = '95279108';
     const PRODUCT_ID = 'A-' + TCIN;
-    const TARGET_URL = 'https://www.target.com/p/-/A-' + TCIN;
     const CHANNEL_PATH = '/channels/1349910660317843540/1369180056144056321';
     const SIGNAL_KEY = 'hootloot_target_drop_' + TCIN;
     const HEARTBEAT_KEY = 'hootloot_discord_heartbeat_' + TCIN;
-    const KEYWORDS = ['95279108','A-95279108','owala','kanto','first partners','pokemon'];
+    const EVENT_KEY = 'hootloot_target_event_' + TCIN;
 
     const isDiscord = location.hostname === 'discord.com' && location.pathname.includes(CHANNEL_PATH);
-    const isTarget = location.hostname === 'www.target.com' &&
-        (location.pathname.includes('/A-' + TCIN) || location.pathname.includes('/lists/favorites'));
+    const isFavorites = location.hostname === 'www.target.com' && location.pathname.includes('/lists/favorites');
+    const isProduct = location.hostname === 'www.target.com' && location.pathname.includes('/A-' + TCIN);
 
     function panel(text, ok = true) {
         const id = 'hootloot-' + TCIN + '-panel';
@@ -39,7 +38,8 @@
                 'box-shadow:0 8px 30px rgba(0,0,0,.5)';
             document.body.appendChild(p);
         }
-        p.innerHTML = '<b style="font-size:16px">Target 95279108 Monitor</b><div id="hootloot-status" style="margin-top:7px">' + text + '</div>';
+        p.innerHTML = '<b style="font-size:16px">Target 95279108 Monitor</b>' +
+            '<div id="hootloot-status" style="margin-top:7px">' + text + '</div>';
     }
 
     function setStatus(text) {
@@ -48,116 +48,186 @@
     }
 
     async function sendSignal(reason) {
-        await GM.setValue(SIGNAL_KEY, { token: Date.now(), tcin: TCIN, reason });
+        const token = Date.now();
+        await GM.setValue(SIGNAL_KEY, { token, tcin: TCIN, reason });
+        await GM.setValue(EVENT_KEY, { token, type: 'drop', reason, time: Date.now() });
         setStatus('DROP SIGNAL SENT — ' + reason);
     }
 
-    // DISCORD: heartbeat + new-message monitoring
+    // ---------------- DISCORD ----------------
     if (isDiscord) {
         panel('Starting Discord monitor…');
-        const seen = new WeakSet();
+
+        const seenTexts = new Set();
+        let lastActivity = Date.now();
 
         async function heartbeat(note) {
-            await GM.setValue(HEARTBEAT_KEY, { time: Date.now(), note: note || 'watching' });
+            await GM.setValue(HEARTBEAT_KEY, {
+                time: Date.now(),
+                note: note || 'watching',
+                channel: CHANNEL_PATH
+            });
         }
 
-        function normalizedText(el) {
-            return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        function textOf(el) {
+            return (el.innerText || el.textContent || '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .toLowerCase();
         }
 
         function matchesDrop(text) {
+            // Exact TCIN/Target ID is a definitive match.
             if (text.includes(TCIN) || text.includes(PRODUCT_ID)) return true;
-            const productWords = ['owala','kanto','first partners','pokemon'];
-            const dropWords = ['restock','available','in stock','live','drop','back'];
-            return productWords.some(w => text.includes(w)) && dropWords.some(w => text.includes(w));
+
+            // Product name + an availability/drop phrase.
+            const productWords = ['owala', 'kanto', 'first partners', 'pokemon'];
+            const dropWords = [
+                'restock', 'restocked', 'available', 'in stock',
+                'back in stock', 'live', 'drop', 'dropped', 'up'
+            ];
+
+            return productWords.some(w => text.includes(w)) &&
+                   dropWords.some(w => text.includes(w));
         }
 
-        function inspect(el) {
-            if (!(el instanceof Element) || seen.has(el)) return;
-            seen.add(el);
-            const text = normalizedText(el);
-            if (!text) return;
-            heartbeat('message activity seen');
-            if (matchesDrop(text)) sendSignal('Discord message matched the monitored item');
+        function scanMessages() {
+            const nodes = document.querySelectorAll(
+                'li, article, [data-list-item-id], [role="listitem"], [class*="message"]'
+            );
+
+            for (const el of nodes) {
+                const text = textOf(el);
+                if (!text || text.length > 2000) continue;
+
+                // Only evaluate each exact visible message text once.
+                if (seenTexts.has(text)) continue;
+                seenTexts.add(text);
+
+                lastActivity = Date.now();
+                if (matchesDrop(text)) {
+                    sendSignal('Discord message matched 95279108');
+                    return;
+                }
+            }
+
+            // Keep memory bounded.
+            if (seenTexts.size > 1000) seenTexts.clear();
         }
 
         setTimeout(() => {
             heartbeat('monitor started');
-            panel('🟢 DISCORD MONITORING — heartbeat active');
-            setInterval(() => heartbeat('heartbeat'), 5000);
+            panel('🟢 DISCORD MONITORING — scanning channel');
 
-            const observer = new MutationObserver(mutations => {
-                for (const mutation of mutations) {
-                    for (const node of mutation.addedNodes) {
-                        if (!(node instanceof Element)) continue;
-                        inspect(node);
-                        node.querySelectorAll('li, article, [data-list-item-id], [class*="message"], [role="listitem"]').forEach(inspect);
-                    }
-                }
-            });
+            // IMPORTANT: periodic scanning catches Discord virtual-DOM updates
+            // that don't reliably appear as simple MutationObserver additions.
+            scanMessages();
+            setInterval(() => {
+                scanMessages();
+                heartbeat('heartbeat');
+            }, 1000);
+
+            // Also observe major page changes for faster reaction.
+            const observer = new MutationObserver(() => scanMessages());
             observer.observe(document.body, { childList: true, subtree: true });
         }, 2000);
     }
 
-    // TARGET: heartbeat status + cart action
-    if (isTarget) {
+    // ---------------- TARGET FAVORITES ----------------
+    if (isFavorites) {
         panel('Checking Discord monitor…');
         let lastToken = null;
         let working = false;
 
-        function findAddToCart() {
-            return [...document.querySelectorAll('button')].find(button => {
-                if (button.disabled) return false;
-                const text = (button.innerText || button.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                return text === 'add to cart' || text.includes('add to cart');
-            });
-        }
-
-        async function checkDiscordStatus() {
-            try {
-                const hb = await GM.getValue(HEARTBEAT_KEY, null);
-                if (!hb || !hb.time) {
-                    setStatus('🔴 DISCORD MONITOR NOT SEEN — open the Discord channel');
-                    return;
-                }
-                const age = Date.now() - hb.time;
-                if (age < 15000) {
-                    setStatus('🟢 DISCORD MONITOR ACTIVE — last heartbeat ' + Math.round(age / 1000) + 's ago');
-                } else if (age < 60000) {
-                    setStatus('🟡 DISCORD MONITOR STALE — last heartbeat ' + Math.round(age / 1000) + 's ago');
-                } else {
-                    setStatus('🔴 DISCORD MONITOR APPEARS STOPPED — last heartbeat ' + Math.round(age / 1000) + 's ago');
-                }
-            } catch (e) {
-                setStatus('🔴 Could not read Discord heartbeat: ' + e.message);
-            }
-        }
-
-        async function openProductAndCart() {
-            if (working) return;
-            working = true;
-            setStatus('DROP DETECTED — opening Target product…');
-
-            if (!location.pathname.includes('/A-' + TCIN)) {
-                location.href = TARGET_URL;
+        async function discordStatus() {
+            const hb = await GM.getValue(HEARTBEAT_KEY, null);
+            if (!hb || !hb.time) {
+                setStatus('🔴 DISCORD NOT CONNECTED — open the Discord channel');
                 return;
             }
 
+            const age = Date.now() - hb.time;
+            if (age < 15000) {
+                setStatus('🟢 DISCORD ACTIVE — last heartbeat ' + Math.round(age / 1000) + 's ago');
+            } else if (age < 60000) {
+                setStatus('🟡 DISCORD STALE — last heartbeat ' + Math.round(age / 1000) + 's ago');
+            } else {
+                setStatus('🔴 DISCORD STOPPED — last heartbeat ' + Math.round(age / 1000) + 's ago');
+            }
+        }
+
+        function findFavoriteCard() {
+            const links = [...document.querySelectorAll('a[href]')];
+            const link = links.find(a => {
+                const href = a.href || '';
+                return href.includes('/A-' + TCIN);
+            });
+
+            if (!link) return null;
+
+            // Find the product-card container around the exact product link.
+            return link.closest(
+                'article, li, [role="listitem"], [data-test], [class*="ProductCard"], [class*="product-card"]'
+            ) || link.parentElement?.parentElement?.parentElement || link.parentElement;
+        }
+
+        function findCartButton(card) {
+            if (!card) return null;
+
+            const buttons = [...card.querySelectorAll('button')];
+
+            return buttons.find(button => {
+                if (button.disabled) return false;
+                const text = (button.innerText || button.textContent || '')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .toLowerCase();
+
+                return text === 'add to cart' ||
+                       text.includes('add to cart');
+            }) || null;
+        }
+
+        async function addFromFavorites() {
+            if (working) return;
+            working = true;
+
+            setStatus('DROP DETECTED — finding 95279108 in Favorites…');
+
+            // Stay on Favorites. Do NOT navigate to the product page.
+            let card = null;
             let button = null;
-            for (let i = 0; i < 30 && !button; i++) {
-                button = findAddToCart();
-                if (!button) await new Promise(r => setTimeout(r, 500));
+
+            for (let i = 0; i < 20 && !button; i++) {
+                card = findFavoriteCard();
+                button = findCartButton(card);
+
+                if (!button) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
             }
 
             if (!button) {
-                panel('DROP DETECTED, but Add to cart was not found. No purchase was made.', false);
+                panel(
+                    'DROP DETECTED, but Add to cart was not found on the 95279108 Favorites card. No purchase was made.',
+                    false
+                );
                 working = false;
                 return;
             }
 
             button.scrollIntoView({ block: 'center', behavior: 'instant' });
-            setStatus('DROP DETECTED — clicking Add to cart once…');
+            setStatus('DROP DETECTED — clicking Favorites Add to cart once…');
+
+            // One normal Target UI click. No checkout/payment.
             button.click();
+
+            await GM.setValue(EVENT_KEY, {
+                token: Date.now(),
+                type: 'cart_clicked',
+                tcin: TCIN,
+                time: Date.now()
+            });
 
             setTimeout(() => {
                 setStatus('ADD TO CART CLICKED — STOPPED. Check your cart.');
@@ -168,18 +238,27 @@
         async function poll() {
             try {
                 const signal = await GM.getValue(SIGNAL_KEY, null);
+
                 if (signal && signal.tcin === TCIN && signal.token !== lastToken) {
                     lastToken = signal.token;
-                    await openProductAndCart();
+                    await addFromFavorites();
                     return;
                 }
-                await checkDiscordStatus();
+
+                await discordStatus();
             } catch (e) {
                 setStatus('Error: ' + e.message);
             }
         }
 
-        setInterval(poll, 3000);
+        // Poll continuously; no Target refresh is required.
+        setInterval(poll, 1000);
         poll();
+    }
+
+    // Product-page match is intentionally informational only.
+    // The requested workflow stays on Favorites and clicks its Add to cart button.
+    if (isProduct) {
+        panel('This script uses the Favorites card for 95279108. Return to Target Favorites.');
     }
 })();
